@@ -3,15 +3,22 @@
 # Line 1: Model | Context% | +added/-removed | git branch
 # Line 2: 5h rate limit progress bar
 # Line 3: 7d rate limit progress bar
+# Line 4: model-scoped weekly limit (e.g. Fable) progress bar
 #
-# レートリミット情報はHaiku probeのレスポンスヘッダーから取得。
+# 2〜4行目には使用率に加えて「ペース差分」（本来の消費ペースとの差、緑=余裕/赤=超過）と
+# リセットまでの残り時間を表示する。
+#
+# 5h/7d のレートリミット情報はHaiku probeのレスポンスヘッダーから取得。
 # 結果は /tmp/claude-usage-cache.json に360秒キャッシュ。
+# モデル別週次枠（Fable等）は OAuth usage API から取得し、
+# /tmp/claude-model-usage-cache.json に60秒キャッシュ（更新はバックグラウンド）。
 # 依存: jq / curl。認証情報は macOS Keychain または ~/.claude/.credentials.json から取得。
 
 input=$(cat)
 
 # ---------- ANSI Colors ----------
 GREEN=$'\e[38;2;151;201;195m'
+PACE_GREEN=$'\e[38;2;152;195;121m'
 YELLOW=$'\e[38;2;229;192;123m'
 RED=$'\e[38;2;224;108;117m'
 GRAY=$'\e[38;2;74;88;92m'
@@ -54,6 +61,53 @@ progress_bar() {
   printf '%s' "$bar"
 }
 
+# ---------- Pace indicator ----------
+# ウィンドウ開始 (= reset - window長) からの経過時間割合を「本来のペース」とし、
+# 実使用% との差分のみを表示する（例: -13% = ペースより13pt余裕 / +18% = 超過）。
+# ペース以下=緑 / ペース超過=赤。
+pace_display() {
+  local used="$1" reset_epoch="$2" window="$3"
+  if [ -z "$used" ] || [ -z "$reset_epoch" ] || [ "$reset_epoch" = "0" ]; then
+    return
+  fi
+  local now start elapsed pace diff color sign
+  now=$(date +%s)
+  start=$((reset_epoch - window))
+  elapsed=$((now - start))
+  [ "$elapsed" -lt 0 ] && elapsed=0
+  [ "$elapsed" -gt "$window" ] && elapsed=$window
+  pace=$((elapsed * 100 / window))
+  diff=$((used - pace))
+  if [ "$diff" -le 0 ]; then
+    color="$PACE_GREEN"
+  else
+    color="$RED"
+  fi
+  sign=""
+  [ "$diff" -gt 0 ] && sign="+"
+  printf '%s%s%s%%%s' "$color" "$sign" "$diff" "$RESET"
+}
+
+# ---------- Remaining time until reset (e.g. "1h23m") ----------
+remaining_until() {
+  local epoch="$1"
+  [ -z "$epoch" ] || [ "$epoch" = "0" ] && return
+  local now diff d h m
+  now=$(date +%s)
+  diff=$((epoch - now))
+  [ "$diff" -lt 0 ] && diff=0
+  d=$((diff / 86400))
+  h=$((diff % 86400 / 3600))
+  m=$((diff % 3600 / 60))
+  if [ "$d" -gt 0 ]; then
+    printf '%dd%dh' "$d" "$h"
+  elif [ "$h" -gt 0 ]; then
+    printf '%dh%dm' "$h" "$m"
+  else
+    printf '%dm' "$m"
+  fi
+}
+
 # ---------- Parse stdin (single jq call) ----------
 eval "$(echo "$input" | jq -r '
   "model_name=" + (.model.display_name // "Unknown" | @sh),
@@ -84,9 +138,9 @@ FIVE_HOUR_RESET=""
 SEVEN_DAY_UTIL=""
 SEVEN_DAY_RESET=""
 
-fetch_usage() {
+# macOS: Keychain / Linux: ~/.claude/.credentials.json
+get_access_token() {
   local token
-  # macOS: Keychain / Linux: ~/.claude/.credentials.json
   token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)
   if [ -z "$token" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
     token=$(cat "$HOME/.claude/.credentials.json")
@@ -100,6 +154,12 @@ fetch_usage() {
     access_token="$token"
   fi
   [ -z "$access_token" ] && return 1
+  printf '%s' "$access_token"
+}
+
+fetch_usage() {
+  local access_token
+  access_token=$(get_access_token) || return 1
 
   # Tiny Haiku call (max_tokens=1) to get rate limit response headers
   local full_response
@@ -175,6 +235,53 @@ to_pct() {
 FIVE_HOUR_PCT=$(to_pct "$FIVE_HOUR_UTIL")
 SEVEN_DAY_PCT=$(to_pct "$SEVEN_DAY_UTIL")
 
+# ---------- Model-scoped weekly usage (e.g. Fable) via OAuth usage API ----------
+# Haiku probe のヘッダーにはモデル別枠が無いため、OAuth usage API
+# (https://api.anthropic.com/api/oauth/usage) の limits[] から kind=weekly_scoped
+# （モデルスコープ付き週次枠）を取得する。
+# 描画をブロックしないよう、TTL切れ時はバックグラウンドで更新して既存キャッシュを表示する。
+MODEL_USAGE_CACHE="/tmp/claude-model-usage-cache.json"
+MODEL_USAGE_TTL=60
+
+refresh_model_usage_cache() {
+  local access_token resp tmp
+  access_token=$(get_access_token) || return
+
+  resp=$(curl -sS --max-time 5 "https://api.anthropic.com/api/oauth/usage" \
+    -H "Authorization: Bearer ${access_token}" \
+    -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null) || return
+
+  tmp=$(mktemp "/tmp/.claude-model-usage.XXXXXX") || return
+  if echo "$resp" | jq -e '
+      [.limits[]? | select(.kind == "weekly_scoped" and .scope.model != null)][0]
+      | {label: (.scope.model.display_name // "Model"), pct: .percent, resets_at: .resets_at}
+    ' > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mv "$tmp" "$MODEL_USAGE_CACHE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+model_cache_age=$MODEL_USAGE_TTL
+if [ -f "$MODEL_USAGE_CACHE" ]; then
+  model_cache_mtime=$(stat -f '%m' "$MODEL_USAGE_CACHE" 2>/dev/null || stat -c '%Y' "$MODEL_USAGE_CACHE" 2>/dev/null || echo 0)
+  model_cache_age=$(( $(date +%s) - model_cache_mtime ))
+fi
+if [ "$model_cache_age" -ge "$MODEL_USAGE_TTL" ]; then
+  ( refresh_model_usage_cache ) </dev/null >/dev/null 2>&1 &
+fi
+
+MODEL_SCOPED_LABEL=""
+MODEL_SCOPED_PCT=""
+MODEL_SCOPED_RESET_ISO=""
+if [ -f "$MODEL_USAGE_CACHE" ]; then
+  eval "$(jq -r '
+    "MODEL_SCOPED_LABEL=" + ((.label // "") | @sh),
+    "MODEL_SCOPED_PCT=" + ((.pct // "") | tostring | @sh),
+    "MODEL_SCOPED_RESET_ISO=" + ((.resets_at // "") | tostring | @sh)
+  ' "$MODEL_USAGE_CACHE" 2>/dev/null)"
+fi
+
 # ---------- Format reset time (from epoch seconds) ----------
 STATUSLINE_TZ="${STATUSLINE_TZ:-Asia/Tokyo}"
 format_epoch_time() {
@@ -189,12 +296,12 @@ format_epoch_time() {
 
 five_reset_display=""
 if [ -n "$FIVE_HOUR_RESET" ] && [ "$FIVE_HOUR_RESET" != "0" ]; then
-  five_reset_display="Resets $(format_epoch_time "$FIVE_HOUR_RESET" "+%-I%p") (${STATUSLINE_TZ})"
+  five_reset_display="Resets $(format_epoch_time "$FIVE_HOUR_RESET" "+%-I%p") (${STATUSLINE_TZ}) · in $(remaining_until "$FIVE_HOUR_RESET")"
 fi
 
 seven_reset_display=""
 if [ -n "$SEVEN_DAY_RESET" ] && [ "$SEVEN_DAY_RESET" != "0" ]; then
-  seven_reset_display="Resets $(format_epoch_time "$SEVEN_DAY_RESET" "+%b %-d at %-I%p") (${STATUSLINE_TZ})"
+  seven_reset_display="Resets $(format_epoch_time "$SEVEN_DAY_RESET" "+%b %-d at %-I%p") (${STATUSLINE_TZ}) · in $(remaining_until "$SEVEN_DAY_RESET")"
 fi
 
 # ---------- Format context used% ----------
@@ -223,6 +330,8 @@ if [ -n "$FIVE_HOUR_PCT" ]; then
   c5=$(color_for_pct "$FIVE_HOUR_PCT")
   bar5=$(progress_bar "$FIVE_HOUR_PCT")
   line2="${c5}⏱ 5h  ${bar5}  ${FIVE_HOUR_PCT}%${RESET}"
+  pace5=$(pace_display "$FIVE_HOUR_PCT" "$FIVE_HOUR_RESET" $((5 * 3600)))
+  [ -n "$pace5" ] && line2+="  ${pace5}"
   [ -n "$five_reset_display" ] && line2+="  ${DIM}${five_reset_display}${RESET}"
 else
   line2="${GRAY}⏱ 5h  ▱▱▱▱▱▱▱▱▱▱  --%${RESET}"
@@ -234,9 +343,34 @@ if [ -n "$SEVEN_DAY_PCT" ]; then
   c7=$(color_for_pct "$SEVEN_DAY_PCT")
   bar7=$(progress_bar "$SEVEN_DAY_PCT")
   line3="${c7}📅 7d  ${bar7}  ${SEVEN_DAY_PCT}%${RESET}"
+  pace7=$(pace_display "$SEVEN_DAY_PCT" "$SEVEN_DAY_RESET" $((7 * 86400)))
+  [ -n "$pace7" ] && line3+="  ${pace7}"
   [ -n "$seven_reset_display" ] && line3+="  ${DIM}${seven_reset_display}${RESET}"
 else
   line3="${GRAY}📅 7d  ▱▱▱▱▱▱▱▱▱▱  --%${RESET}"
+fi
+
+# ---------- Line 4 (model-scoped weekly, e.g. Fable) ----------
+line4=""
+model_scoped_label="${MODEL_SCOPED_LABEL:-Model}"
+if [ -n "$MODEL_SCOPED_PCT" ] && [ "$MODEL_SCOPED_PCT" != "null" ]; then
+  MODEL_SCOPED_PCT=$(printf "%.0f" "$MODEL_SCOPED_PCT" 2>/dev/null || echo "")
+fi
+if [ -n "$MODEL_SCOPED_PCT" ]; then
+  cm=$(color_for_pct "$MODEL_SCOPED_PCT")
+  barm=$(progress_bar "$MODEL_SCOPED_PCT")
+  line4="${cm}✨ ${model_scoped_label}  ${barm}  ${MODEL_SCOPED_PCT}%${RESET}"
+  # resets_at は ISO 8601 (UTC)。秒までに切り詰めて epoch へ変換し 7d と同じ書式で表示
+  model_reset_iso="${MODEL_SCOPED_RESET_ISO%%.*}"
+  if [ -n "$model_reset_iso" ]; then
+    model_reset_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%S" "$model_reset_iso" "+%s" 2>/dev/null || \
+                        date -u -d "$model_reset_iso" "+%s" 2>/dev/null || echo "")
+    if [ -n "$model_reset_epoch" ]; then
+      pacem=$(pace_display "$MODEL_SCOPED_PCT" "$model_reset_epoch" $((7 * 86400)))
+      [ -n "$pacem" ] && line4+="  ${pacem}"
+      line4+="  ${DIM}Resets $(format_epoch_time "$model_reset_epoch" "+%b %-d at %-I%p") (${STATUSLINE_TZ}) · in $(remaining_until "$model_reset_epoch")${RESET}"
+    fi
+  fi
 fi
 
 # ---------- RunCat Neo custom metrics (opt-in) ----------
@@ -301,4 +435,9 @@ write_runcat_snapshot 2>/dev/null || true
 # ---------- Output ----------
 printf '%s\n' "$line1"
 printf '%s\n' "$line2"
-printf '%s' "$line3"
+if [ -n "$line4" ]; then
+  printf '%s\n' "$line3"
+  printf '%s' "$line4"
+else
+  printf '%s' "$line3"
+fi
