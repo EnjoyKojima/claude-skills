@@ -47,20 +47,27 @@ ln -s "$PWD/skills/pr-review" ~/.claude/skills/pr-review
 
 ## statusline/
 
-Claude Code のカスタム statusline。3行構成で以下を表示する。
+Claude Code のカスタム statusline。最大4行構成で以下を表示する。
 
 ```
 🤖 Fable 5 │ 📊 42% │ ✏️  +120/-30 │ 🔀 feature/foo
-⏱ 5h  ▰▰▰▱▱▱▱▱▱▱  32%  Resets 3pm (Asia/Tokyo)
-📅 7d  ▰▰▰▰▰▱▱▱▱▱  51%  Resets Jul 20 at 9am (Asia/Tokyo)
+⏱ 5h  ▰▰▰▱▱▱▱▱▱▱  32%  -18%  Resets 3pm (Asia/Tokyo) · in 1h23m
+📅 7d  ▰▰▰▰▰▱▱▱▱▱  51%  +4%   Resets Jul 20 at 9am (Asia/Tokyo) · in 2d5h
+✨ Fable  ▰▰▰▰▱▱▱▱▱▱  35%  -26%  Resets Jul 20 at 8am (Asia/Tokyo) · in 2d4h
 ```
 
 - **1行目**: モデル名 / コンテキスト使用率 / 追加・削除行数 / gitブランチ
-- **2〜3行目**: 5時間・7日間のレートリミット使用率（プログレスバー + リセット時刻）
+- **2〜3行目**: 5時間・7日間のレートリミット使用率（プログレスバー + ペース差分 + リセット時刻・残り時間）
+- **4行目**: モデル別週次枠（Fable 等、アカウントに枠がある場合のみ表示）
 
-レートリミットは Haiku への極小リクエスト（`max_tokens: 1`、1トークン）の
-レスポンスヘッダーから取得し、360秒キャッシュする。認証は各自の Claude Code
-ログイン情報（macOS Keychain / `~/.claude/.credentials.json`）を使う。
+ペース差分（`-18%` / `+4%`）は「ウィンドウの経過時間から見た本来の消費ペース」との差。
+マイナス（緑）はペースより余裕あり、プラス（赤）はペース超過を意味する。
+
+5h/7d のレートリミットは Haiku への極小リクエスト（`max_tokens: 1`、1トークン）の
+レスポンスヘッダーから取得し、360秒キャッシュする。モデル別週次枠は OAuth usage API
+から取得し、60秒キャッシュをバックグラウンド更新する（描画はブロックしない）。
+認証は各自の Claude Code ログイン情報
+（macOS Keychain / `~/.claude/.credentials.json`）を使う。
 
 ### インストール
 
